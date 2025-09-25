@@ -1,0 +1,43 @@
+# Audio Device Configuration
+# 音频设备配置文件 - 手动指定设备版本
+
+# 音频模式
+audio_mode: "microphone"  # microphone 或 preset
+
+# ASR (语音识别) 配置
+asr:
+  # 输入设备 - 使用实际存在的USB音频设备
+  input_device: hw:0,0  # USB Composite Device: Audio
+  
+  # 音频参数 - 优化延迟和识别精度
+  sample_rate: 48000  # USB设备支持48000Hz
+  channels: 1
+  chunk_duration: 0.05  # 减小块大小，提高响应速度
+  silence_threshold: 0.01  # 使用原来的阈值
+  silence_duration: 2.0  # 增加静音持续时间，减少误触发
+  min_recording_duration: 1.0  # 增加最小录制时长，确保有足够音频
+  
+  # 语音活动检测(VAD)参数 - 过滤噪声和短音频
+  vad_threshold: 0.005  # 语音活动检测能量阈值，低于此值视为噪声
+  min_audio_length: 1.0  # 最小音频长度（秒），低于此值跳过识别
+  
+  # Whisper Small模型优化参数
+  whisper_model: small  # 使用small模型提高识别精度
+  whisper_temperature: 0.0  # 降低温度提高准确性
+  whisper_beam_size: 5  # 增加beam size提高精度
+  whisper_language: zh  # 强制中文识别
+
+# TTS (语音合成) 配置  
+tts:
+  # 输出设备 - 手动指定
+  output_device: "hw:1,0"  # ALSA设备名称，例如：hw:2,0, default, pulse
+  
+  # Edge TTS配置
+  voice: "zh-CN-XiaoxiaoNeural"
+  rate: "+0%"
+  volume: "+0%"
+
+# 调试配置
+debug:
+  enabled: false
+  log_device_info: true

@@ -1,0 +1,12 @@
+# Process Text Service
+# 处理文本输入并生成意图和动作
+
+string input_text           # 输入文本
+string session_id           # 会话ID
+string language_code        # 语言代码
+---
+bool success                # 处理是否成功
+string intent_type          # 识别的意图类型
+string action_json          # 生成的动作JSON
+float64 confidence          # 置信度
+string error_message        # 错误信息

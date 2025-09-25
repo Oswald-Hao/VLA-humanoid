@@ -1,0 +1,18 @@
+# Generate Action Service
+# 根据意图生成结构化动作JSON
+
+string intent_type           # 意图类型
+string intent_description    # 意图描述
+string[] entities            # 实体列表
+string[] slots               # 槽位填充结果
+string context               # 上下文信息
+---
+bool success                 # 是否成功
+string action_id             # 动作ID
+string action_type           # 动作类型
+string json_data             # JSON格式的动作数据
+float64 confidence           # 置信度
+string[] required_skills    # 所需技能列表
+string[] dependencies        # 依赖项
+string execution_plan        # 执行计划
+string error_message         # 错误信息

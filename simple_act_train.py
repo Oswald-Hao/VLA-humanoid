@@ -12,71 +12,22 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import os
 import json
-from datetime import datetime
 from typing import Dict, Optional, List, Any
-from tqdm import tqdm
-import math
 import sys
-from pathlib import Path
-from collections import defaultdict
+import argparse
 
 # 导入必要的模块
-from modules.direct_action_predictor import create_direct_action_model
 from fixed_dataset import FixedTrajectoryDataset
 from action_quality_validator import ActionQualityValidator, TrainingQualityMonitor
 
 # ==============================================
-# 1. 核心模型架构 - 改进的关键关节专注ACT模型
+# 1. 核心模型架构 - 关键关节专注的ACT模型
 # ==============================================
 
-class EnhancedTimeEncoding(nn.Module):
-    """增强的时间编码模块"""
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # 多尺度时间编码
-        self.linear_encoding = nn.Linear(1, hidden_dim // 4)
-        self.sinusoidal_encoding = nn.Linear(1, hidden_dim // 4)
-        self.phase_encoding = nn.Linear(1, hidden_dim // 4)
-        self.frequency_encoding = nn.Linear(1, hidden_dim // 4)
-        
-        # 组合层
-        self.combination = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-    
-    def forward(self, t):
-        # t: [batch_size, seq_len] or [batch_size, seq_len, 1]
-        if t.dim() == 2:
-            t = t.unsqueeze(-1)
-        
-        # 线性编码
-        linear_feat = self.linear_encoding(t)
-        
-        # 正弦编码
-        sinusoidal_feat = torch.sin(self.sinusoidal_encoding(t)) + torch.cos(self.sinusoidal_encoding(t))
-        
-        # 相位编码
-        phase_feat = torch.sin(2 * np.pi * self.phase_encoding(t))
-        
-        # 频率编码
-        freq_feat = torch.sin(4 * np.pi * self.frequency_encoding(t))
-        
-        # 组合所有特征
-        combined = torch.cat([linear_feat, sinusoidal_feat, phase_feat, freq_feat], dim=-1)
-        return self.combination(combined)
-
-class ImprovedKeyJointACTGenerator(nn.Module):
+class KeyJointACTGenerator(nn.Module):
     """
-    改进的关键关节专注ACT生成器 - 解决中间状态预测衰减问题
-    核心改进：
-    1. 动作强度调节机制
-    2. 增强的时间编码
-    3. 状态感知增强
-    4. 多尺度预测
+    关键关节专注的ACT生成器
+    核心思想：自动识别每个指令的关键关节，重点学习这些关节的变化
     """
     
     def __init__(self, config: Dict):
@@ -87,33 +38,12 @@ class ImprovedKeyJointACTGenerator(nn.Module):
         self.action_dim = config['action_dim']
         self.num_instructions = config['num_instructions']
         self.hidden_dim = config['hidden_dim']
-        self.trajectory_length = config.get('trajectory_length', 32)
+        self.trajectory_length = 32  # 回退：从128改回32，原始长度
         self.dropout = config['dropout']
         
         # 关键关节数量 - 每个指令重点关注的前N个关节
-        self.key_joints_per_instruction = config.get('key_joints_per_instruction', 8)
+        self.key_joints_per_instruction = config.get('key_joints_per_instruction', 16)  # 阶段3：从8增加到16，支持通用动作框架
         
-        # 改进的组件
-        self.enhanced_time_encoding = EnhancedTimeEncoding(self.hidden_dim // 4)
-        
-        # 动作强度调节器
-        self.action_intensity_regulator = nn.Sequential(
-            nn.Linear(self.hidden_dim + 64, self.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim // 2, self.hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim // 4, 1),
-            nn.Sigmoid()
-        )
-        
-        # 状态感知增强器
-        self.state_aware_enhancer = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.state_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, self.hidden_dim)
-        )
         
         # 第一层：指令分类器
         self.instruction_classifier = nn.Sequential(
@@ -126,176 +56,165 @@ class ImprovedKeyJointACTGenerator(nn.Module):
             nn.Linear(64, self.num_instructions)
         )
         
-        # 增强的状态编码器
+        # 状态编码器
         self.state_encoder = nn.Sequential(
             nn.Linear(self.state_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, self.hidden_dim * 2)
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         
         # 指令嵌入
         self.instruction_embedding = nn.Embedding(self.num_instructions, 64)
         
-        # 关节重要性分析器
-        self.joint_importance_analyzer = nn.Sequential(
-            nn.Linear(self.hidden_dim + 64, self.hidden_dim // 2),
+        # 时间编码
+        self.time_encoding = nn.Sequential(
+            nn.Linear(1, self.hidden_dim // 4),
             nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim // 2, self.action_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(self.hidden_dim // 4, self.hidden_dim // 4)
         )
         
-        # 关键关节预测器 - 每个指令独立的关键关节预测
+        # 时序编码器 - 使用Transformer更好地处理时序依赖
+        temporal_input_size = self.hidden_dim + 64 + self.hidden_dim // 4  # state + instruction + time
+        
+        # 关节重要性分析器 - 为每个指令分析关节重要性
+        self.joint_importance_analyzer = nn.Sequential(
+            nn.Linear(self.hidden_dim + 64, 128),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(128, self.action_dim),
+            nn.Sigmoid()  # 输出每个关节的重要性权重
+        )
+        
+        # 第二层：指令专用的关键关节预测器
         self.key_joint_predictors = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(self.hidden_dim + 64 + self.hidden_dim // 4, self.hidden_dim),
+                nn.Linear(temporal_input_size, 256),
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn.Linear(256, 128),
                 nn.ReLU(),
-                nn.Linear(self.hidden_dim // 2, self.key_joints_per_instruction)
+                nn.Dropout(self.dropout),
+                nn.Linear(128, self.key_joints_per_instruction)  # 只预测关键关节
             ) for _ in range(self.num_instructions)
         ])
         
-        # 全关节扩展器
-        self.full_joint_expander = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.key_joints_per_instruction, self.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim // 2, self.action_dim)
-            ) for _ in range(self.num_instructions)
-        ])
+        # 完整关节输出层 - 从关键关节扩展到所有关节
+        self.full_joint_expander = nn.Sequential(
+            nn.Linear(self.key_joints_per_instruction, 128),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(128, self.action_dim)
+        )
         
-        # 时序编码器 - 使用Transformer
-        temporal_input_size = self.hidden_dim + 64 + self.hidden_dim // 4
+        # 时序编码器
         self.temporal_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=temporal_input_size,
                 nhead=8,
-                dim_feedforward=self.hidden_dim * 2,
+                dim_feedforward=self.hidden_dim,
                 dropout=self.dropout,
                 batch_first=True
             ),
             num_layers=3
         )
         
-        # 多尺度预测头
-        self.prediction_heads = nn.ModuleList([
-            nn.Linear(temporal_input_size, self.action_dim) for _ in range(3)
-        ])
         
-        # 输出层
-        self.output_layer = nn.Linear(self.action_dim * 3, self.action_dim)
         
-    def forward(self, states, instruction_ids, timesteps):
-        """
-        前向传播
-        states: [batch_size, state_dim]
-        instruction_ids: [batch_size]
-        timesteps: [batch_size, trajectory_length]
-        """
-        batch_size = states.shape[0]
+        # 动作历史上下文支持 - 更长的历史长度
+        self.history_length = config.get('history_length', 128)  # 历史步数，128步提供更充分的上下文
+        self.history_encoding = nn.Sequential(
+            nn.Linear(self.action_dim * self.history_length, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
+        )
         
-        # 编码状态
-        state_features = self.state_encoder(states)  # [batch_size, hidden_dim * 2]
-        state_features = state_features[:, :self.hidden_dim]  # 取前一半
+        # 权重初始化
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """权重初始化 - 使用更保守的初始化策略"""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # 使用更小的初始化范围，防止早期训练不稳定
+                if module.weight.dim() >= 2:  # 确保至少是2维张量
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                else:
+                    nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+            elif isinstance(module, nn.TransformerEncoderLayer):
+                for param_name, param in module.named_parameters():
+                    if 'weight' in param_name and param.dim() >= 2:
+                        nn.init.xavier_uniform_(param, gain=0.5)
+                    elif 'bias' in param_name:
+                        nn.init.constant_(param, 0.0)
+    
+    def forward(self, start_states, instruction_ids, target_actions=None, action_history=None):
+        """前向传播 - 支持动作历史上下文"""
+        batch_size = start_states.size(0)
+        device = start_states.device
         
-        # 编码指令
-        instruction_emb = self.instruction_embedding(instruction_ids)  # [batch_size, 64]
+        # 状态编码
+        state_encoded = self.state_encoder(start_states)
         
-        # 增强时间编码
-        time_features = self.enhanced_time_encoding(timesteps)  # [batch_size, trajectory_length, hidden_dim // 4]
+        # 第一层：指令分类
+        instruction_logits = self.instruction_classifier(state_encoded)
         
-        # 扩展时间特征到轨迹长度
-        time_features = time_features.mean(dim=1, keepdim=True).expand(-1, self.trajectory_length, -1)
+        # 指令嵌入
+        instruction_emb = self.instruction_embedding(instruction_ids)
         
-        # 动作强度调节
-        intensity_input = torch.cat([state_features, instruction_emb], dim=-1)
-        action_intensity = self.action_intensity_regulator(intensity_input)  # [batch_size, 1]
+        # 处理动作历史上下文
+        if action_history is not None:
+            # 编码动作历史
+            history_encoded = self.history_encoding(action_history)
+            # 将历史信息融合到状态编码中
+            state_encoded = state_encoded + history_encoded
         
-        # 状态感知增强
-        state_aware_input = torch.cat([state_features, states], dim=-1)
-        enhanced_features = self.state_aware_enhancer(state_aware_input)  # [batch_size, hidden_dim]
+        # 分析关节重要性
+        joint_importance_input = torch.cat([state_encoded, instruction_emb], dim=-1)
+        joint_importance = self.joint_importance_analyzer(joint_importance_input)
         
-        # 指令分类
-        classification_logits = self.instruction_classifier(enhanced_features)
+        # 时间编码
+        time_steps = torch.linspace(0, 1, self.trajectory_length, device=device)
+        time_embed = self.time_encoding(time_steps.unsqueeze(-1)).unsqueeze(0).expand(batch_size, -1, -1)
         
-        # 关节重要性分析
-        importance_input = torch.cat([enhanced_features, instruction_emb], dim=-1)
-        joint_importance = self.joint_importance_analyzer(importance_input)  # [batch_size, action_dim]
+        # 准备时序输入
+        state_expanded = state_encoded.unsqueeze(1).expand(-1, self.trajectory_length, -1)
+        instruction_expanded = instruction_emb.unsqueeze(1).expand(-1, self.trajectory_length, -1)
         
-        # 为每个样本获取关键关节预测
-        key_joint_predictions = []
-        full_joint_predictions = []
-        
-        for i in range(self.num_instructions):
-            mask = (instruction_ids == i)
-            if mask.sum() > 0:
-                masked_features = enhanced_features[mask]
-                masked_emb = instruction_emb[mask]
-                masked_time = time_features[mask]
-                
-                # 关键关节预测
-                key_joint_input = torch.cat([masked_features, masked_emb, masked_time.mean(dim=1)], dim=-1)
-                key_joint_pred = self.key_joint_predictors[i](key_joint_input)  # [num_samples, key_joints_per_instruction]
-                
-                # 全关节扩展
-                full_joint_pred = self.full_joint_expander[i](key_joint_pred)  # [num_samples, action_dim]
-                
-                key_joint_predictions.append(key_joint_pred)
-                full_joint_predictions.append(full_joint_pred)
-        
-        # 合并所有预测
-        if key_joint_predictions:
-            key_joint_preds = torch.cat(key_joint_predictions, dim=0)
-            full_joint_preds = torch.cat(full_joint_predictions, dim=0)
-        else:
-            key_joint_preds = torch.zeros(batch_size, self.key_joints_per_instruction).to(states.device)
-            full_joint_preds = torch.zeros(batch_size, self.action_dim).to(states.device)
+        temporal_input = torch.cat([state_expanded, instruction_expanded, time_embed], dim=-1)
         
         # 时序编码
-        temporal_input = torch.cat([
-            enhanced_features.unsqueeze(1).expand(-1, self.trajectory_length, -1),
-            instruction_emb.unsqueeze(1).expand(-1, self.trajectory_length, -1),
-            time_features
-        ], dim=-1)
+        temporal_output = self.temporal_encoder(temporal_input)
         
-        temporal_features = self.temporal_encoder(temporal_input)
+        # 第二层：指令专用的关键关节预测
+        key_joint_actions = []
+        for i in range(batch_size):
+            instruction_id = instruction_ids[i].item()
+            predictor = self.key_joint_predictors[instruction_id]
+            
+            # 预测关键关节
+            key_action = predictor(temporal_output[i])
+            key_joint_actions.append(key_action)
         
-        # 多尺度预测
-        multi_scale_predictions = []
-        for head in self.prediction_heads:
-            pred = head(temporal_features)
-            multi_scale_predictions.append(pred)
+        key_joint_actions = torch.stack(key_joint_actions, dim=0)
         
-        # 合并多尺度预测
-        combined_predictions = torch.cat(multi_scale_predictions, dim=-1)
-        final_predictions = self.output_layer(combined_predictions)
+        # 扩展到完整关节输出
+        full_joint_actions = []
+        for t in range(self.trajectory_length):
+            key_at_t = key_joint_actions[:, t, :]
+            full_at_t = self.full_joint_expander(key_at_t)
+            full_joint_actions.append(full_at_t)
         
-        # 应用动作强度调节
-        final_predictions = final_predictions * action_intensity.unsqueeze(-1).unsqueeze(-1)
+        predicted_actions = torch.stack(full_joint_actions, dim=1)
         
-        # 与全关节预测融合
-        final_output = final_predictions + full_joint_preds.unsqueeze(1) * 0.1
-        
-        # 确保输出维度正确 [batch_size, trajectory_length, action_dim]
-        if final_output.dim() == 4:
-            # 如果是 [batch_size, 1, trajectory_length, action_dim]，移除第1维
-            if final_output.shape[1] == 1:
-                final_output = final_output.squeeze(1)
-            # 如果是 [batch_size, batch_size, trajectory_length, action_dim]，需要修正
-            elif final_output.shape[1] == final_output.shape[0]:
-                final_output = final_output[:, 0, :, :]  # 只取第一个样本的预测
-        
-        return {
-            'predictions': final_output,
-            'classification_logits': classification_logits,
-            'joint_importance': joint_importance,
-            'action_intensity': action_intensity,
-            'key_joint_predictions': key_joint_preds
-        }
+        return predicted_actions, instruction_logits, joint_importance, key_joint_actions
+    
+
 # ==============================================
 # 2. 数据集类
 # ==============================================
@@ -316,13 +235,14 @@ class KeyJointDataset(Dataset):
         
         print(f"采样结果: 总样本数 {len(self.samples)}")
         instruction_counts = {}
-        for instruction, _, _ in self.samples:
+        for sample in self.samples:
+            instruction = sample[0]  # 第一个元素始终是指令
             instruction_counts[instruction] = instruction_counts.get(instruction, 0) + 1
         for instruction, count in instruction_counts.items():
             print(f"  {instruction}: {count} 个样本")
     
     def _balanced_sampling_strategy(self):
-        """平衡的采样策略 - 确保不同动作类型有均衡的样本数量"""
+        """增强的采样策略 - 支持任意起始位置训练"""
         samples = []
         
         # 按指令分组文件
@@ -376,7 +296,80 @@ class KeyJointDataset(Dataset):
             
             samples.extend(instruction_samples)
         
-        return samples
+        # 新增：添加随机起始位置扰动，增强泛化能力
+        enhanced_samples = self._add_arbitrary_start_samples(samples)
+        
+        return enhanced_samples
+    
+    def _add_arbitrary_start_samples(self, base_samples):
+        """添加简化的任意起始位置样本"""
+        enhanced_samples = []
+        
+        for sample in base_samples:
+            instruction, file_name, start_idx = sample
+            
+            # 添加原始样本
+            enhanced_samples.append(sample)
+            
+            # 只对10%的原始样本添加任意起始样本（更低比例）
+            if np.random.random() < 0.1:
+                # 加载完整轨迹数据
+                trajectory_path = os.path.join(self.data_dir, file_name)
+                with open(trajectory_path, 'r') as f:
+                    data = json.load(f)
+                
+                observations = data['observations']
+                joint_positions = np.array([obs['joint_pos'] for obs in observations])
+                total_frames = len(joint_positions)
+                
+                if total_frames > self.trajectory_length * 2:
+                    # 只生成1个任意起始样本
+                    mid_start = self.trajectory_length
+                    mid_end = total_frames - self.trajectory_length
+                    
+                    if mid_end > mid_start:
+                        # 真正的任意起始位置
+                        arbitrary_start = np.random.randint(mid_start, mid_end)
+                        
+                        # 获取真实的当前状态
+                        current_state = joint_positions[arbitrary_start]
+                        
+                        # 获取从当前状态开始的目标轨迹
+                        target_trajectory = joint_positions[arbitrary_start:arbitrary_start + self.trajectory_length]
+                        
+                        # 确保目标轨迹长度正确
+                        if len(target_trajectory) == self.trajectory_length:
+                            # 创建状态转移学习样本
+                            enhanced_samples.append((
+                                instruction, file_name, arbitrary_start, 
+                                tuple(current_state), 'state_transfer'
+                            ))
+        
+        return enhanced_samples
+    
+    def _compute_normalized_action_pattern(self, trajectory, start_state):
+        """计算归一化的动作模式 - 增强模型对动作本质的学习"""
+        # 计算相对于起始位置的位移
+        displacements = trajectory - start_state
+        
+        # 计算动作的幅度范围
+        joint_ranges = np.max(np.abs(displacements), axis=0)
+        joint_ranges[joint_ranges == 0] = 1.0  # 避免除零
+        
+        # 归一化位移模式
+        normalized_pattern = displacements / joint_ranges
+        
+        # 添加时间进度信息
+        time_progress = np.linspace(0, 1, len(trajectory))
+        time_encoding = np.sin(time_progress * np.pi)  # 使用正弦函数编码时间进度
+        
+        # 组合归一化模式和时间信息
+        enhanced_pattern = np.concatenate([
+            normalized_pattern.flatten(),
+            time_encoding
+        ])
+        
+        return enhanced_pattern
     
     def __len__(self):
         return len(self.samples)
@@ -425,8 +418,67 @@ class KeyJointDataset(Dataset):
         
         return segment[:trajectory_length]
     
+    def _generate_action_history(self, joint_positions, start_idx, history_length=128, current_state=None):
+        """生成动作历史上下文 - 支持任意起始位置"""
+        # 如果提供了当前状态（用于任意起始位置推理）
+        if current_state is not None:
+            # 计算相对于原始轨迹的偏移
+            original_start = joint_positions[0] if len(joint_positions) > 0 else current_state
+            state_offset = current_state - original_start
+            
+            # 获取历史轨迹段
+            history_start = max(0, start_idx - history_length)
+            history_segment = joint_positions[history_start:start_idx]
+            
+            # 对历史轨迹应用相同的偏移
+            if len(history_segment) > 0:
+                history_segment = history_segment + state_offset
+            
+            # 历史不足时用偏移后的初始状态填充
+            if len(history_segment) < history_length:
+                padded_start = original_start + state_offset
+                padding = np.tile(padded_start, (history_length - len(history_segment), 1))
+                history_segment = np.vstack([padding, history_segment])
+        else:
+            # 原有逻辑：用于正常训练
+            history_start = max(0, start_idx - history_length)
+            history_segment = joint_positions[history_start:start_idx]
+            
+            if len(history_segment) < history_length:
+                if len(history_segment) > 0:
+                    initial_state = joint_positions[0]
+                    padding = np.tile(initial_state, (history_length - len(history_segment), 1))
+                    history_segment = np.vstack([padding, history_segment])
+                else:
+                    history_segment = np.zeros((history_length, joint_positions.shape[1]))
+        
+        # 确保历史长度正确
+        history_segment = history_segment[:history_length]
+        
+        # 展平历史数据
+        return history_segment.flatten()
+    
     def __getitem__(self, idx):
-        instruction, file_name, start_idx = self.samples[idx]
+        sample = self.samples[idx]
+        
+        # 处理不同类型的样本
+        if len(sample) == 5 and sample[4] == 'state_transfer':
+            # 状态转移学习样本
+            instruction, file_name, start_idx, current_state_tuple, sample_type = sample
+            is_state_transfer = True
+            current_state = np.array(current_state_tuple)
+        else:
+            # 原始样本
+            if len(sample) == 4:
+                instruction, file_name, start_idx, random_offset = sample
+                is_enhanced = True
+                is_state_transfer = False
+                current_state = None
+            else:
+                instruction, file_name, start_idx = sample
+                is_enhanced = False
+                is_state_transfer = False
+                current_state = None
         
         # 加载数据
         trajectory_path = os.path.join(self.data_dir, file_name)
@@ -437,17 +489,26 @@ class KeyJointDataset(Dataset):
         observations = data['observations']
         joint_positions = np.array([obs['joint_pos'] for obs in observations])
         
-        # 采样轨迹段
-        trajectory = self.sample_trajectory_segment(joint_positions, start_idx, self.trajectory_length)
-        
-        # 获取起始状态
-        start_state = trajectory[0]
-        
-        # 计算目标动作（绝对位置）
-        target_actions = trajectory  # 直接使用绝对位置
+        if is_state_transfer:
+            # 状态转移学习：使用真实的当前状态和目标轨迹
+            start_state = current_state
+            target_trajectory = joint_positions[start_idx:start_idx + self.trajectory_length]
+            target_actions = target_trajectory
+            
+            # 生成基于真实历史的动作历史
+            action_history = self._generate_action_history(
+                joint_positions, start_idx, 128, current_state
+            )
+            
+        else:
+            # 原始训练逻辑
+            trajectory = self.sample_trajectory_segment(joint_positions, start_idx, self.trajectory_length)
+            start_state = trajectory[0]
+            target_actions = trajectory
+            action_history = self._generate_action_history(joint_positions, start_idx)
         
         # 分析关节重要性
-        joint_importance = self.analyze_joint_importance(trajectory)
+        joint_importance = self.analyze_joint_importance(target_actions)
         
         # 获取指令ID
         instruction_id = self.instruction_to_id[instruction]
@@ -457,8 +518,11 @@ class KeyJointDataset(Dataset):
             'target_actions': target_actions.astype(np.float32),
             'instruction_id': np.array(instruction_id, dtype=np.int64),
             'joint_importance': joint_importance.astype(np.float32),
+            'action_history': action_history.astype(np.float32),
             'file_name': file_name,
-            'start_idx': start_idx
+            'start_idx': start_idx,
+            'is_state_transfer': is_state_transfer,
+            'sample_type': sample_type if is_state_transfer else 'normal'
         }
 
 # ==============================================
@@ -466,19 +530,25 @@ class KeyJointDataset(Dataset):
 # ==============================================
 
 class KeyJointACTLoss(nn.Module):
-    """关键关节专注的ACT损失函数"""
+    """关键关节专注的ACT损失函数 - 增强版，防止轨迹回溯"""
     
     def __init__(self, 
                  classification_weight=10.0, 
                  diversity_weight=5.0,
                  key_joint_weight=5.0,
                  stability_weight=0.01,
+                 unidirectional_weight=0.02,  # 极低权重：几乎不影响训练
+                 continuity_weight=0.01,  # 极低权重：几乎不影响训练
+                 goal_directed_weight=0.015,  # 极低权重：几乎不影响训练
                  instruction_target_variances=None):  # 支持不同指令的目标变化量
         super().__init__()
         self.classification_weight = classification_weight
         self.diversity_weight = diversity_weight
         self.key_joint_weight = key_joint_weight
         self.stability_weight = stability_weight
+        self.unidirectional_weight = unidirectional_weight
+        self.continuity_weight = continuity_weight
+        self.goal_directed_weight = goal_directed_weight
         
         # 基于真实数据统计的目标变化量
         if instruction_target_variances is None:
@@ -507,11 +577,131 @@ class KeyJointACTLoss(nn.Module):
         
         return overall_variance
     
+    def compute_unidirectional_loss(self, actions, start_states):
+        """计算单向递进损失 - 防止明显的轨迹回溯，改进版"""
+        batch_size, seq_len, action_dim = actions.shape
+        
+        if seq_len <= 3:
+            return torch.tensor(0.0, device=actions.device)
+        
+        # 计算每一步相对于起始状态的位移
+        start_expanded = start_states.unsqueeze(1).expand(-1, seq_len, -1)
+        displacement_from_start = actions - start_expanded
+        
+        # 主要改进：不是强制单调递增，而是惩罚明显的回溯
+        # 计算短期的位移变化，避免惩罚正常的周期性动作
+        window_size = min(5, seq_len // 2)
+        
+        # 计算每个关节的短期趋势
+        short_term_regression = 0.0
+        count = 0
+        
+        for i in range(window_size, seq_len - window_size):
+            # 计算当前窗口与前一个窗口的平均位置
+            current_window = actions[:, i:i+window_size, :]
+            prev_window = actions[:, i-window_size:i, :]
+            
+            current_mean = torch.mean(current_window, dim=1)  # [batch_size, action_dim]
+            prev_mean = torch.mean(prev_window, dim=1)  # [batch_size, action_dim]
+            
+            # 计算位移变化
+            displacement_change = current_mean - prev_mean
+            
+            # 只有当变化方向与整体动作方向相反时才惩罚
+            # 使用整体趋势作为参考
+            overall_trend = actions[:, -window_size:, :] - actions[:, :window_size, :]
+            overall_direction = torch.mean(overall_trend, dim=(1, 2))  # [batch_size]
+            
+            # 计算局部变化与整体趋势的一致性
+            local_change_magnitude = torch.norm(displacement_change, dim=-1)  # [batch_size]
+            
+            # 只惩罚幅度较大的回溯，避免影响正常的微小调整
+            regression_threshold = 0.1  # 调整这个阈值
+            large_regression = torch.relu(local_change_magnitude - regression_threshold)
+            
+            short_term_regression += torch.mean(large_regression)
+            count += 1
+        
+        if count > 0:
+            regression_penalty = short_term_regression / count
+        else:
+            regression_penalty = torch.tensor(0.0, device=actions.device)
+        
+        return regression_penalty
+    
+    def compute_continuity_loss(self, actions):
+        """计算连续性约束损失 - 防止突然的跳跃式回溯，改进版"""
+        batch_size, seq_len, action_dim = actions.shape
+        
+        if seq_len <= 3:
+            return torch.tensor(0.0, device=actions.device)
+        
+        # 计算一阶差分（速度）
+        first_diff = torch.diff(actions, dim=1)  # [batch_size, seq_len-1, action_dim]
+        
+        # 计算二阶差分（加速度）
+        second_diff = torch.diff(first_diff, dim=1)  # [batch_size, seq_len-2, action_dim]
+        
+        # 改进：只惩罚极端的加速度，允许正常的动作变化
+        acceleration_magnitude = torch.norm(second_diff, dim=-1)  # [batch_size, seq_len-2]
+        
+        # 设置合理的加速度阈值，只惩罚超出正常范围的突变
+        acceleration_threshold = 0.5  # 调整这个阈值
+        extreme_acceleration = torch.relu(acceleration_magnitude - acceleration_threshold)
+        acceleration_penalty = torch.mean(extreme_acceleration)
+        
+        # 改进方向突变检测，只惩罚剧烈的方向改变
+        velocity_norms = torch.norm(first_diff, dim=-1, keepdim=True)
+        normalized_velocities = first_diff / (velocity_norms + 1e-8)
+        
+        # 计算相邻速度向量的点积
+        velocity_dot_products = torch.sum(
+            normalized_velocities[:, :-1] * normalized_velocities[:, 1:], dim=-1
+        )
+        
+        # 只惩罚剧烈的方向改变（点积 < -0.5，即角度 > 120度）
+        severe_direction_change = torch.relu(-0.5 - velocity_dot_products)
+        direction_change_penalty = torch.mean(severe_direction_change)
+        
+        return acceleration_penalty + direction_change_penalty
+    
+    def compute_goal_directed_loss(self, actions, target_actions):
+        """计算终点导向损失 - 引导轨迹朝着目标方向发展，简化版"""
+        batch_size, seq_len, action_dim = actions.shape
+        
+        if seq_len < 4:
+            return torch.tensor(0.0, device=actions.device)
+        
+        # 简化：只比较轨迹终点与目标终点的距离
+        predicted_final = actions[:, -1, :]  # [batch_size, action_dim]
+        target_final = target_actions[:, -1, :]  # [batch_size, action_dim]
+        
+        # 计算终点误差，但只惩罚较大的误差
+        final_error = torch.norm(predicted_final - target_final, dim=-1)  # [batch_size]
+        
+        # 设置合理的误差阈值，只惩罚严重偏离目标的情况
+        error_threshold = 0.5  # 调整这个阈值
+        large_error = torch.relu(final_error - error_threshold)
+        
+        # 平均惩罚
+        misalignment_penalty = torch.mean(large_error)
+        
+        return misalignment_penalty
+    
+       
     def forward(self, predicted_actions, target_actions, instruction_logits, instruction_ids, 
-                joint_importance, key_joint_actions):
-        """计算损失 - 极简版本，确保数值稳定"""
+                joint_importance, key_joint_actions, start_states=None):
+        """计算损失 - 简化版，支持任意起始位置"""
         
         batch_size = predicted_actions.size(0)
+        # 使用传入的真实起始状态，如果未提供则使用目标轨迹起始状态
+        if start_states is None:
+            start_states = target_actions[:, 0]  # 向后兼容
+        
+        # 简化的任意起点损失：确保轨迹从正确的起始状态开始
+        start_alignment_loss = torch.mean(torch.norm(
+            predicted_actions[:, 0, :] - start_states, dim=-1
+        ))
         
         # 1. 基础动作预测损失
         action_loss = nn.functional.mse_loss(predicted_actions, target_actions)
@@ -543,24 +733,34 @@ class KeyJointACTLoss(nn.Module):
             for instr_id in unique_instructions:
                 mask = instruction_ids == instr_id
                 if mask.any():
-                    # 计算每个指令的平均模式，确保是2D张量
-                    pattern_mean = torch.mean(predicted_actions[mask], dim=(0, 1))  # [action_dim]
+                    pattern_mean = torch.mean(predicted_actions[mask], dim=(0, 1))
                     pattern_means.append(pattern_mean)
             
             if len(pattern_means) > 1:
-                pattern_means = torch.stack(pattern_means)  # [num_instructions, action_dim]
-                # 确保是2D张量才能使用pdist
-                if pattern_means.dim() == 2:
-                    pattern_diff_matrix = torch.pdist(pattern_means, p=2)
-                    diversity_loss = torch.mean(torch.relu(0.5 - pattern_diff_matrix))
+                pattern_means = torch.stack(pattern_means)
+                pattern_diff_matrix = torch.pdist(pattern_means, p=2)
+                diversity_loss = torch.mean(torch.relu(0.5 - pattern_diff_matrix))
         
-        # 综合损失 - 极简版本
+        # 6. 新增：单向递进损失 - 防止轨迹回溯
+        unidirectional_loss = self.compute_unidirectional_loss(predicted_actions, start_states)
+        
+        # 7. 新增：连续性约束损失 - 防止突然的跳跃式回溯
+        continuity_loss = self.compute_continuity_loss(predicted_actions)
+        
+        # 8. 新增：终点导向损失 - 引导轨迹朝着目标方向发展
+        goal_directed_loss = self.compute_goal_directed_loss(predicted_actions, target_actions)
+        
+        # 综合损失 - 包含简化的任意起点损失
         losses = [
             action_loss,
             self.classification_weight * classification_loss,
             self.key_joint_weight * key_joint_loss,
             self.diversity_weight * diversity_loss,
-            self.stability_weight * stability_loss
+            self.stability_weight * stability_loss,
+            self.unidirectional_weight * unidirectional_loss,
+            self.continuity_weight * continuity_loss,
+            self.goal_directed_weight * goal_directed_loss,
+            0.1 * start_alignment_loss  # 简化的任意起点损失，小权重避免干扰
         ]
         
         # 检查每个损失项是否有效
@@ -581,6 +781,10 @@ class KeyJointACTLoss(nn.Module):
             'key_joint_loss': key_joint_loss,
             'diversity_loss': diversity_loss,
             'stability_loss': stability_loss,
+            'unidirectional_loss': unidirectional_loss,
+            'continuity_loss': continuity_loss,
+            'goal_directed_loss': goal_directed_loss,
+            'start_alignment_loss': start_alignment_loss,
             'key_joint_variance': torch.mean(overall_variance)
         }
 
@@ -588,35 +792,39 @@ class KeyJointACTLoss(nn.Module):
 # 4. 训练函数
 # ==============================================
 
-def train_key_joint_act_model():
+def train_key_joint_act_model(args=None):
     """训练关键关节专注的ACT模型"""
     print("开始训练关键关节专注的ACT模型...")
     print("核心特性：自动识别关键关节，专注于变化大的关节学习")
     print("预测后32步，使用Transformer时序模型")
     
-    # 模型配置 - 使用更保守的配置
+    # 模型配置 - 使用更保守的配置，支持动作历史上下文
     model_config = {
         'state_dim': 26,
         'action_dim': 26,
         'num_instructions': 2,
-        'hidden_dim': 256,
-        'trajectory_length': 32,  # 预测后32步，简化学习任务
-        'dropout': 0.2,  # 降低dropout，防止早期训练不稳定
-        'key_joints_per_instruction': 8,  # 每个指令重点关注8个关节
+        'hidden_dim': args.hidden_dim if args else 256,
+        'trajectory_length': 32,  # 回退：从128改回32，原始长度
+        'dropout': args.dropout if args else 0.2,  # 降低dropout，防止早期训练不稳定
+        'key_joints_per_instruction': 16,  # 阶段3：从8增加到16，支持通用动作框架
         'predict_differences': False,  # 直接预测绝对位置
-        'signal_amplification': 1.0  # 不使用信号放大
+        'signal_amplification': 1.0,  # 不使用信号放大
+        'history_length': 128  # 动作历史上下文长度，128步提供更充分的上下文
     }
     
-    # 训练配置 - 平衡性能和稳定性
+    # 训练配置 - 平衡性能和稳定性，新增防回溯损失，支持命令行参数
     training_config = {
-        'learning_rate': 1e-4,  # 适中的学习率
+        'learning_rate': args.learning_rate if args else 1e-4,  # 适中的学习率
         'weight_decay': 1e-4,  # 适中的权重衰减
-        'batch_size': 64,  # 恢复较大的batch size以提高GPU利用率
-        'epochs': 2000,
+        'batch_size': args.batch_size if args else 64,  # 恢复较大的batch size以提高GPU利用率
+        'epochs': args.epochs if args else 2000,
         'classification_weight': 1.0,  # 降低分类权重
         'diversity_weight': 0.5,  # 降低多样性权重
         'key_joint_weight': 0.5,  # 降低关键关节权重
-        'stability_weight': 0.05  # 降低稳定性权重
+        'stability_weight': 0.05,  # 降低稳定性权重
+        'unidirectional_weight': args.unidirectional_weight if args else 0.03,  # 新增：单向递进权重 - 防止轨迹回溯 (降低76%)
+        'continuity_weight': args.continuity_weight if args else 0.015,  # 新增：连续性约束权重 - 防止跳跃式回溯 (降低76%)
+        'goal_directed_weight': args.goal_directed_weight if args else 0.024  # 新增：终点导向权重 - 引导轨迹方向 (降低76%)
     }
     
     # 数据准备
@@ -663,8 +871,8 @@ def train_key_joint_act_model():
     print(f"训练集: {len(train_dataset)}, 验证集: {len(val_dataset)}")
     print(f"数据加载优化: num_workers=4, pin_memory={device.type == 'cuda'}")
     
-    # 创建模型 - 使用改进的版本
-    model = ImprovedKeyJointACTGenerator(model_config).to(device)
+    # 创建模型
+    model = KeyJointACTGenerator(model_config).to(device)
     
     # 启用自动混合精度训练提高GPU性能
     scaler = torch.amp.GradScaler('cuda', init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000) if device.type == 'cuda' else None
@@ -676,12 +884,15 @@ def train_key_joint_act_model():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"模型参数数量: {total_params:,}")
     
-    # 损失函数
+    # 损失函数 - 增强版，包含防回溯损失
     loss_fn = KeyJointACTLoss(
         classification_weight=training_config['classification_weight'],
         diversity_weight=training_config['diversity_weight'],
         key_joint_weight=training_config['key_joint_weight'],
-        stability_weight=training_config['stability_weight']
+        stability_weight=training_config['stability_weight'],
+        unidirectional_weight=training_config['unidirectional_weight'],
+        continuity_weight=training_config['continuity_weight'],
+        goal_directed_weight=training_config['goal_directed_weight']
     )
     
     # 优化器 - 使用更稳定的优化器，启用GPU优化
@@ -703,8 +914,9 @@ def train_key_joint_act_model():
         min_lr=1e-7  # 更低的最小学习率
     )
     
-    # 创建保存目录
-    save_dir = './checkpoints/improved_act_model_v1'
+    # 创建保存目录 - 使用命令行参数指定的模型名称
+    model_name = args.model_name if args else 'anti_regression'
+    save_dir = f'./checkpoints/{model_name}'
     os.makedirs(save_dir, exist_ok=True)
     
     print(f"开始训练...")
@@ -736,6 +948,9 @@ def train_key_joint_act_model():
         train_key_joint_losses = []
         train_diversity_losses = []
         train_stability_losses = []
+        train_unidirectional_losses = []  # 新增：单向递进损失
+        train_continuity_losses = []      # 新增：连续性约束损失
+        train_goal_directed_losses = []   # 新增：终点导向损失
         train_accuracies = []
         train_key_joint_variances = []
         
@@ -743,22 +958,20 @@ def train_key_joint_act_model():
             start_states = batch['start_state'].to(device)
             target_actions = batch['target_actions'].to(device)
             instruction_ids = batch['instruction_id'].to(device)
+            action_history = batch['action_history'].to(device)
             
             # 使用自动混合精度训练
             if scaler:
                 with torch.amp.autocast('cuda'):
-                    # 前向传播
-                    timesteps = torch.arange(0, 32, dtype=torch.float32).unsqueeze(0).expand(start_states.shape[0], -1).to(start_states.device)
-                    model_outputs = model(start_states, instruction_ids, timesteps)
-                    predicted_actions = model_outputs['predictions']
-                    instruction_logits = model_outputs['classification_logits']
-                    joint_importance = model_outputs['joint_importance']
-                    key_joint_actions = model_outputs['key_joint_predictions']
+                    # 前向传播 - 包含动作历史上下文
+                    predicted_actions, instruction_logits, joint_importance, key_joint_actions = model(
+                        start_states, instruction_ids, target_actions, action_history
+                    )
                     
-                    # 计算损失
+                    # 计算损失 - 使用真实的起始状态
                     loss_dict = loss_fn(
                         predicted_actions, target_actions, instruction_logits, instruction_ids,
-                        joint_importance, key_joint_actions
+                        joint_importance, key_joint_actions, start_states
                     )
                 
                 # 质量监控 - 每10个batch监控一次
@@ -766,7 +979,6 @@ def train_key_joint_act_model():
                     batch_quality = quality_monitor.monitor_batch(
                         predicted_actions, target_actions, instruction_ids
                     )
-                    current_quality = batch_quality.get('overall_quality', 0.0)
                 
                 # 简单的反向传播
                 total_loss = loss_dict['total_loss']
@@ -781,13 +993,10 @@ def train_key_joint_act_model():
                 scaler.update()
             else:
                 # CPU模式
-                # 前向传播
-                timesteps = torch.arange(0, 32, dtype=torch.float32).unsqueeze(0).expand(start_states.shape[0], -1).to(start_states.device)
-                model_outputs = model(start_states, instruction_ids, timesteps)
-                predicted_actions = model_outputs['predictions']
-                instruction_logits = model_outputs['classification_logits']
-                joint_importance = model_outputs['joint_importance']
-                key_joint_actions = model_outputs['key_joint_predictions']
+                # 前向传播 - 包含动作历史上下文
+                predicted_actions, instruction_logits, joint_importance, key_joint_actions = model(
+                    start_states, instruction_ids, target_actions, action_history
+                )
                 
                 # 计算损失
                 loss_dict = loss_fn(
@@ -800,7 +1009,6 @@ def train_key_joint_act_model():
                     batch_quality = quality_monitor.monitor_batch(
                         predicted_actions, target_actions, instruction_ids
                     )
-                    current_quality = batch_quality.get('overall_quality', 0.0)
                 
                 # 反向传播
                 optimizer.zero_grad()
@@ -816,6 +1024,9 @@ def train_key_joint_act_model():
             train_key_joint_losses.append(loss_dict['key_joint_loss'].item())
             train_diversity_losses.append(loss_dict['diversity_loss'].item())
             train_stability_losses.append(loss_dict['stability_loss'].item())
+            train_unidirectional_losses.append(loss_dict['unidirectional_loss'].item())  # 新增
+            train_continuity_losses.append(loss_dict['continuity_loss'].item())          # 新增
+            train_goal_directed_losses.append(loss_dict['goal_directed_loss'].item())   # 新增
             train_key_joint_variances.append(loss_dict['key_joint_variance'].item())
             
             # 计算分类准确率
@@ -831,6 +1042,9 @@ def train_key_joint_act_model():
         val_key_joint_losses = []
         val_diversity_losses = []
         val_stability_losses = []
+        val_unidirectional_losses = []  # 新增：单向递进损失
+        val_continuity_losses = []      # 新增：连续性约束损失
+        val_goal_directed_losses = []   # 新增：终点导向损失
         val_accuracies = []
         val_key_joint_variances = []
         
@@ -839,13 +1053,11 @@ def train_key_joint_act_model():
                 start_states = batch['start_state'].to(device)
                 target_actions = batch['target_actions'].to(device)
                 instruction_ids = batch['instruction_id'].to(device)
+                action_history = batch['action_history'].to(device)
                 
-                timesteps = torch.arange(0, 32, dtype=torch.float32).unsqueeze(0).expand(start_states.shape[0], -1).to(start_states.device)
-                model_outputs = model(start_states, instruction_ids, timesteps)
-                predicted_actions = model_outputs['predictions']
-                instruction_logits = model_outputs['classification_logits']
-                joint_importance = model_outputs['joint_importance']
-                key_joint_actions = model_outputs['key_joint_predictions']
+                predicted_actions, instruction_logits, joint_importance, key_joint_actions = model(
+                    start_states, instruction_ids, target_actions, action_history
+                )
                 
                 loss_dict = loss_fn(
                     predicted_actions, target_actions, instruction_logits, instruction_ids,
@@ -861,6 +1073,9 @@ def train_key_joint_act_model():
                     val_key_joint_losses.append(loss_dict['key_joint_loss'].item())
                     val_diversity_losses.append(loss_dict['diversity_loss'].item())
                     val_stability_losses.append(loss_dict['stability_loss'].item())
+                    val_unidirectional_losses.append(loss_dict['unidirectional_loss'].item())  # 新增
+                    val_continuity_losses.append(loss_dict['continuity_loss'].item())          # 新增
+                    val_goal_directed_losses.append(loss_dict['goal_directed_loss'].item())   # 新增
                     val_key_joint_variances.append(loss_dict['key_joint_variance'].item())
                     
                     # 计算分类准确率
@@ -868,13 +1083,16 @@ def train_key_joint_act_model():
                     accuracy = (predicted_ids == instruction_ids).float().mean().item()
                     val_accuracies.append(accuracy)
         
-        # 计算平均损失 - 添加空列表检查
+        # 计算平均损失 - 添加空列表检查，包含新的防回溯损失
         avg_train_loss = np.mean(train_losses) if train_losses else float('nan')
         avg_train_action = np.mean(train_action_losses) if train_action_losses else float('nan')
         avg_train_classification = np.mean(train_classification_losses) if train_classification_losses else float('nan')
         avg_train_key_joint = np.mean(train_key_joint_losses) if train_key_joint_losses else float('nan')
         avg_train_diversity = np.mean(train_diversity_losses) if train_diversity_losses else float('nan')
         avg_train_stability = np.mean(train_stability_losses) if train_stability_losses else float('nan')
+        avg_train_unidirectional = np.mean(train_unidirectional_losses) if train_unidirectional_losses else float('nan')  # 新增
+        avg_train_continuity = np.mean(train_continuity_losses) if train_continuity_losses else float('nan')              # 新增
+        avg_train_goal_directed = np.mean(train_goal_directed_losses) if train_goal_directed_losses else float('nan')     # 新增
         avg_train_accuracy = np.mean(train_accuracies) if train_accuracies else float('nan')
         avg_train_key_variance = np.mean(train_key_joint_variances) if train_key_joint_variances else float('nan')
         
@@ -884,6 +1102,9 @@ def train_key_joint_act_model():
         avg_val_key_joint = np.mean(val_key_joint_losses) if val_key_joint_losses else float('nan')
         avg_val_diversity = np.mean(val_diversity_losses) if val_diversity_losses else float('nan')
         avg_val_stability = np.mean(val_stability_losses) if val_stability_losses else float('nan')
+        avg_val_unidirectional = np.mean(val_unidirectional_losses) if val_unidirectional_losses else float('nan')          # 新增
+        avg_val_continuity = np.mean(val_continuity_losses) if val_continuity_losses else float('nan')                    # 新增
+        avg_val_goal_directed = np.mean(val_goal_directed_losses) if val_goal_directed_losses else float('nan')             # 新增
         avg_val_accuracy = np.mean(val_accuracies) if val_accuracies else float('nan')
         avg_val_key_variance = np.mean(val_key_joint_variances) if val_key_joint_variances else float('nan')
         
@@ -896,14 +1117,16 @@ def train_key_joint_act_model():
         # 质量监控 - 每个epoch结束后生成质量报告
         epoch_quality = quality_monitor.monitor_epoch(epoch)
         
-        # 打印进度 - 每20个epoch打印一次
+        # 打印进度 - 每20个epoch打印一次，包含新的防回溯损失
         if epoch % 20 == 0:
             quality_info = f"Quality: {epoch_quality.get('overall_quality', 0.0):.3f}" if epoch_quality else ""
             print(f"Epoch {epoch+1}/{training_config['epochs']} - "
                   f"Train Total: {avg_train_loss:.4f}, Val Total: {avg_val_loss:.4f}, "
                   f"Val Action: {avg_val_action:.4f}, Val Class: {avg_val_classification:.4f}, "
                   f"Val KeyJoint: {avg_val_key_joint:.4f}, Val Div: {avg_val_diversity:.4f}, "
-                  f"Val Stability: {avg_val_stability:.4f}, Acc: {avg_val_accuracy:.3f}, "
+                  f"Val Stability: {avg_val_stability:.4f}, "
+                  f"Val Uni: {avg_val_unidirectional:.4f}, Val Cont: {avg_val_continuity:.4f}, "
+                  f"Val Goal: {avg_val_goal_directed:.4f}, Acc: {avg_val_accuracy:.3f}, "
                   f"KeyVar: {avg_val_key_variance:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}, "
                   f"{quality_info}")
             
@@ -964,7 +1187,12 @@ def train_key_joint_act_model():
     print("="*50)
     
     # 保存质量历史数据
-    quality_monitor.save_quality_history(os.path.join(save_dir, 'quality_history.json'))
+    try:
+        quality_monitor.save_quality_history(os.path.join(save_dir, 'quality_history.json'))
+        print("质量历史数据保存成功")
+    except Exception as e:
+        print(f"保存质量历史数据时出错: {e}")
+        # 不影响训练继续进行
     
     return model, model_config, training_config
 
@@ -972,29 +1200,75 @@ def train_key_joint_act_model():
 # 5. 主函数
 # ==============================================
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='VLA项目关键关节专注ACT训练')
+    parser.add_argument('--model_name', type=str, default='anti_regression', 
+                       help='模型保存目录名称 (默认: anti_regression)')
+    parser.add_argument('--epochs', type=int, default=2000, 
+                       help='训练轮数 (默认: 2000)')
+    parser.add_argument('--batch_size', type=int, default=64, 
+                       help='批次大小 (默认: 64)')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, 
+                       help='学习率 (默认: 1e-4)')
+    parser.add_argument('--hidden_dim', type=int, default=256, 
+                       help='隐藏层维度 (默认: 256)')
+    parser.add_argument('--dropout', type=float, default=0.2, 
+                       help='Dropout率 (默认: 0.2)')
+    parser.add_argument('--unidirectional_weight', type=float, default=0.03, 
+                       help='单向递进损失权重 (降低76%: 从0.125降到0.03，极低约束)')
+    parser.add_argument('--continuity_weight', type=float, default=0.015, 
+                       help='连续性约束损失权重 (降低76%: 从0.0625降到0.015，极低约束)')
+    parser.add_argument('--goal_directed_weight', type=float, default=0.024, 
+                       help='终点导向损失权重 (降低76%: 从0.1降到0.024，极低约束)')
+    parser.add_argument('--no_anti_regression', action='store_true', 
+                       help='完全禁用防回溯损失，恢复到原始版本')
+    return parser.parse_args()
+
 def main():
     """主训练函数"""
+    # 解析命令行参数
+    args = parse_args()
+    
+    # 如果选择完全禁用防回溯损失，设置权重为0
+    if args.no_anti_regression:
+        args.unidirectional_weight = 0.0
+        args.continuity_weight = 0.0
+        args.goal_directed_weight = 0.0
+        print("🚫 防回溯损失已完全禁用，恢复到原始训练模式")
+    
     print("=" * 60)
-    print("VLA项目关键关节专注ACT训练")
+    print("VLA项目关键关节专注ACT训练 - 增强防回溯版")
     print("=" * 60)
     print("核心特性：")
     print("1. 自动识别每个指令的关键关节")
     print("2. 专注于变化大的关节学习")
     print("3. 使用Transformer时序模型预测后32步")
     print("4. 稳定的训练策略，避免早期震荡")
+    print("5. 阶段3：扩展关键关节数量（8→16），支持通用动作框架")
+    print("=" * 60)
+    print(f"训练参数:")
+    print(f"  模型名称: {args.model_name}")
+    print(f"  训练轮数: {args.epochs}")
+    print(f"  批次大小: {args.batch_size}")
+    print(f"  学习率: {args.learning_rate}")
+    print(f"  隐藏层维度: {args.hidden_dim}")
+    print(f"  Dropout率: {args.dropout}")
+    print(f"  防回溯损失权重: 单向({args.unidirectional_weight}), 连续({args.continuity_weight}), 终点({args.goal_directed_weight}) [优化: 降低76%极低约束]")
+    print(f"  关键关节数量: 16 [阶段3: 从8增加到16]")
     print("=" * 60)
     
     try:
-        model, model_config, training_config = train_key_joint_act_model()
+        model, model_config, training_config = train_key_joint_act_model(args)
         
         print("\n" + "=" * 60)
         print("训练完成！")
         print("=" * 60)
         print(f"模型配置: {model_config}")
         print(f"训练配置: {training_config}")
-        print(f"模型已保存到: ./checkpoints/key_joint_act_model_v1/best_model.pth")
+        print(f"模型已保存到: ./checkpoints/{args.model_name}/best_model.pth")
         print("\n使用方法：")
-        print("python simple_act_train.py")
+        print(f"python simple_act_train.py --model_name {args.model_name} --epochs {args.epochs}")
         
     except Exception as e:
         print(f"训练过程中出现错误: {e}")
@@ -1008,599 +1282,3 @@ if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
 
-class JointSpecializedPredictor(nn.Module):
-    """
-    关节专用预测器 - 符合CRITICAL PRINCIPLE
-    第一层：指令分类器
-    第二层：每个指令专用的关节预测器，专注于特定关节
-    """
-    
-    def __init__(self, base_model, action_dim=26, hidden_dim=256, chunk_length=100, 
-                 instruction_vocab_size=2, condition_dim=256):
-        super().__init__()
-        self.base_model = base_model
-        self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
-        self.chunk_length = chunk_length
-        self.instruction_vocab_size = instruction_vocab_size
-        self.condition_dim = condition_dim
-        
-        # 第一层：指令分类器 - 必须有
-        self.instruction_classifier = nn.Sequential(
-            nn.Linear(condition_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, instruction_vocab_size)
-        )
-        
-        # 状态编码器
-        self.state_encoder = nn.Sequential(
-            nn.Linear(26, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, hidden_dim)
-        )
-        
-        # 条件编码器
-        self.condition_encoder = nn.Sequential(
-            nn.Linear(condition_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, hidden_dim)
-        )
-        
-        # 指令嵌入
-        self.instruction_embedding = nn.Embedding(instruction_vocab_size, 32)
-        
-        # 时序编码器
-        self.temporal_input_size = hidden_dim * 2 + 32 + 1  # state + condition + instruction + time
-        self.temporal_encoder = nn.LSTM(
-            input_size=self.temporal_input_size,
-            hidden_size=hidden_dim,
-            num_layers=3,
-            batch_first=True,
-            dropout=0.3,
-            bidirectional=False
-        )
-        
-        # 第二层：每个指令专用的动作预测器
-        # wave指令专用 - 专注于wave动作的关键关节
-        self.wave_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, action_dim)
-        )
-        
-        # welcome指令专用 - 专注于welcome动作的关键关节
-        self.welcome_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, action_dim)
-        )
-        
-        # 关节重要性权重 - 学习每个指令对哪些关节更重要
-        self.wave_joint_weights = nn.Parameter(torch.ones(action_dim) / action_dim)
-        self.welcome_joint_weights = nn.Parameter(torch.ones(action_dim) / action_dim)
-        
-        # 损失权重
-        self.classification_weight = 10.0
-        self.diversity_weight = 5.0
-        
-    def forward(self, instruction_ids: torch.Tensor, state: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """关节专用的前向传播 - 符合CRITICAL PRINCIPLE"""
-        
-        # 获取基础模型的条件编码
-        base_outputs = self.base_model(
-            instruction_ids=instruction_ids,
-            state=state,
-            visual_features=None,
-            target_actions=None
-        )
-        condition = base_outputs['condition']  # [batch_size, condition_dim]
-        
-        batch_size = condition.size(0)
-        device = condition.device
-        
-        # 第一层：指令分类
-        instruction_logits = self.instruction_classifier(condition)  # [batch_size, vocab_size]
-        
-        # 状态编码
-        state_encoded = self.state_encoder(state)  # [batch_size, hidden_dim]
-        condition_encoded = self.condition_encoder(condition)  # [batch_size, hidden_dim]
-        
-        # 指令嵌入
-        instruction_emb = self.instruction_embedding(instruction_ids)  # [batch_size, 32]
-        
-        # 准备时序输入
-        state_expanded = state_encoded.unsqueeze(1).expand(-1, self.chunk_length, -1)
-        condition_expanded = condition_encoded.unsqueeze(1).expand(-1, self.chunk_length, -1)
-        instruction_expanded = instruction_emb.unsqueeze(1).expand(-1, self.chunk_length, -1)
-        
-        # 添加时间编码
-        time_encoding = torch.arange(self.chunk_length, dtype=torch.float32, device=device)
-        time_encoding = time_encoding.unsqueeze(0).unsqueeze(-1) / self.chunk_length
-        time_encoding = time_encoding.expand(batch_size, -1, 1)
-        
-        # 组合时序输入
-        temporal_input = torch.cat([state_expanded, condition_expanded, instruction_expanded, time_encoding], dim=-1)
-        
-        # 通过时序编码器
-        temporal_output, _ = self.temporal_encoder(temporal_input)  # [batch_size, seq_len, hidden_dim]
-        
-        # 为每个指令使用专用预测器
-        wave_actions = self._predict_for_instruction(temporal_output, 0)  # wave指令
-        welcome_actions = self._predict_for_instruction(temporal_output, 1)  # welcome指令
-        
-        # 根据真实指令选择对应的动作
-        predicted_changes = torch.zeros(batch_size, self.chunk_length, self.action_dim, device=device)
-        for i in range(batch_size):
-            if instruction_ids[i] == 0:  # wave
-                predicted_changes[i] = wave_actions[i]
-            else:  # welcome
-                predicted_changes[i] = welcome_actions[i]
-        
-        # 第一个时间步的变化量应该为0
-        predicted_changes[:, 0, :] = 0
-        
-        return {
-            'predicted_changes': predicted_changes,
-            'instruction_logits': instruction_logits,
-            'condition': condition,
-            'wave_actions': wave_actions,
-            'welcome_actions': welcome_actions,
-            'wave_joint_weights': torch.softmax(self.wave_joint_weights, dim=0),
-            'welcome_joint_weights': torch.softmax(self.welcome_joint_weights, dim=0)
-        }
-    
-    def _predict_for_instruction(self, temporal_output: torch.Tensor, instruction_id: int) -> torch.Tensor:
-        """为特定指令预测动作序列"""
-        batch_size, seq_len, hidden_dim = temporal_output.shape
-        
-        # 逐步预测每个时间步
-        predicted_changes = []
-        for t in range(seq_len):
-            hidden_state = temporal_output[:, t, :]  # [batch_size, hidden_dim]
-            
-            if instruction_id == 0:  # wave
-                action_change = self.wave_predictor(hidden_state)
-            else:  # welcome
-                action_change = self.welcome_predictor(hidden_state)
-            
-            predicted_changes.append(action_change)
-        
-        return torch.stack(predicted_changes, dim=1)  # [batch_size, seq_len, action_dim]
-    
-    def compute_loss(self, predicted_changes: torch.Tensor, target_actions: torch.Tensor, 
-                    instruction_logits: torch.Tensor, instruction_ids: torch.Tensor,
-                    wave_actions: torch.Tensor, welcome_actions: torch.Tensor,
-                    wave_joint_weights: torch.Tensor, welcome_joint_weights: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """关节专用的损失函数 - 强制不同指令关注不同关节"""
-        
-        # 1. 动作预测MSE损失
-        action_loss = nn.functional.mse_loss(predicted_changes, target_actions)
-        
-        # 2. 指令分类损失
-        classification_loss = nn.functional.cross_entropy(instruction_logits, instruction_ids)
-        
-        # 3. 指令多样性损失 - 强制不同指令产生不同动作
-        wave_mean = torch.mean(wave_actions, dim=(0, 1))
-        welcome_mean = torch.mean(welcome_actions, dim=(0, 1))
-        pattern_diff = torch.norm(wave_mean - welcome_mean, p=2)
-        diversity_loss = torch.relu(1.0 - pattern_diff)
-        
-        # 4. 关节专用损失 - 强制每个指令专注于不同的关节
-        # 计算每个关节的重要性差异 - 使用更强的约束
-        joint_weight_diff = torch.norm(wave_joint_weights - welcome_joint_weights, p=1)
-        specialization_loss = torch.relu(1.0 - joint_weight_diff)  # 增加目标差异
-        
-        # 添加关节权重熵损失 - 防止所有关节权重相同
-        wave_entropy = -torch.sum(wave_joint_weights * torch.log(wave_joint_weights + 1e-8))
-        welcome_entropy = -torch.sum(welcome_joint_weights * torch.log(welcome_joint_weights + 1e-8))
-        entropy_loss = (wave_entropy + welcome_entropy) / 2.0  # 鼓励专业化
-        
-        # 5. 时间动态损失 - 防止输出恒定值
-        time_variance = torch.var(predicted_changes, dim=1).mean()
-        dynamic_loss = torch.relu(0.001 - time_variance)
-        
-        # 综合损失
-        total_loss = (action_loss + 
-                     self.classification_weight * classification_loss + 
-                     self.diversity_weight * diversity_loss + 
-                     2.0 * specialization_loss + 
-                     0.5 * entropy_loss +  # 添加熵损失
-                     0.01 * dynamic_loss)
-        
-        return {
-            'total_loss': total_loss,
-            'action_loss': action_loss,
-            'classification_loss': classification_loss,
-            'diversity_loss': diversity_loss,
-            'specialization_loss': specialization_loss,
-            'entropy_loss': entropy_loss,
-            'dynamic_loss': dynamic_loss,
-            'pattern_diff': pattern_diff,
-            'joint_weight_diff': joint_weight_diff,
-            'time_variance': time_variance
-        }
-
-class AdaptiveFrameSkipDataset(Dataset):
-    """均匀帧选择数据集 - 避免信号放大"""
-    
-    def __init__(self, data_dir: str, file_names: list, chunk_length: int = 100):
-        self.data_dir = data_dir
-        self.file_names = file_names
-        self.chunk_length = chunk_length
-        
-        # 指令映射
-        self.instruction_to_id = {'wave': 0, 'welcome': 1}
-        
-        # 创建样本列表
-        self.samples = []
-        for file_name in file_names:
-            if 'wave' in file_name:
-                instruction = 'wave'
-            elif 'welcome' in file_name:
-                instruction = 'welcome'
-            else:
-                continue
-            
-            # 加载数据
-            trajectory_path = os.path.join(self.data_dir, file_name)
-            with open(trajectory_path, 'r') as f:
-                data = json.load(f)
-            
-            observations = data['observations']
-            total_frames = len(observations)
-            
-            # 创建多个起始点
-            max_start = total_frames - self.chunk_length
-            if max_start > 0:
-                start_indices = list(range(0, max_start, 20))
-            else:
-                start_indices = [0]
-            
-            for start_idx in start_indices:
-                self.samples.append((instruction, file_name, start_idx))
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def smart_frame_selection(self, joint_positions, start_idx, chunk_length):
-        """均匀帧选择 - 避免信号放大，保持数据统计特性"""
-        # 使用固定步长采样，避免智能选择带来的信号放大
-        total_frames = len(joint_positions)
-        
-        # 计算固定步长
-        if total_frames > chunk_length:
-            step = (total_frames - 1) / (chunk_length - 1)
-            selected_indices = []
-            for i in range(chunk_length):
-                idx = int(start_idx + i * step)
-                idx = min(idx, total_frames - 1)
-                selected_indices.append(idx)
-        else:
-            # 如果数据不够长，重复最后一帧
-            selected_indices = list(range(min(start_idx + chunk_length, total_frames)))
-            while len(selected_indices) < chunk_length:
-                selected_indices.append(selected_indices[-1])
-        
-        return selected_indices[:chunk_length]
-    
-    def __getitem__(self, idx):
-        instruction, file_name, start_idx = self.samples[idx]
-        
-        # 加载数据
-        trajectory_path = os.path.join(self.data_dir, file_name)
-        with open(trajectory_path, 'r') as f:
-            data = json.load(f)
-        
-        # 提取关节数据
-        observations = data['observations']
-        joint_positions = np.array([obs['joint_pos'] for obs in observations])
-        
-        # 智能帧选择
-        selected_indices = self.smart_frame_selection(joint_positions, start_idx, self.chunk_length)
-        trajectory = joint_positions[selected_indices]
-        
-        # 获取起始状态
-        start_state = trajectory[0]
-        
-        # 计算差分动作
-        target_actions = np.diff(trajectory, axis=0)
-        # 填充最后一个时间步
-        last_diff = target_actions[-1:] if len(target_actions) > 0 else np.zeros((1, trajectory.shape[1]))
-        target_actions = np.vstack([target_actions, last_diff])
-        
-        # 获取指令ID
-        instruction_id = self.instruction_to_id[instruction]
-        
-        return {
-            'start_state': start_state.astype(np.float32),
-            'target_actions': target_actions.astype(np.float32),
-            'instruction_id': np.array(instruction_id, dtype=np.int64),
-            'file_name': file_name,
-            'start_idx': start_idx
-        }
-
-def train_joint_specialized_model():
-    """训练关节专用模型 - 符合CRITICAL PRINCIPLE"""
-    print("开始训练关节专用模型...")
-    
-    # 合理容量模型配置
-    model_config = {
-        'action_dim': 26,
-        'chunk_length': 100,
-        'state_dim': 60,
-        'visual_feature_dim': 512,
-        'instruction_vocab_size': 2,
-        'instruction_embed_dim': 64,
-        'condition_dim': 256,  # 适中的条件维度
-        'hidden_dim': 256,     # 适中的隐藏维度
-        'num_heads': 4,        # 适中的注意力头数
-        'num_layers': 3        # 适中的层数
-    }
-    
-    training_config = {
-        'learning_rate': 1e-3,
-        'weight_decay': 1e-4,
-        'batch_size': 8,      # 更小的batch size
-        'epochs': 1000,
-        'change_threshold': 0.001,
-        'merge_window_size': 5
-    }
-    
-    # 数据准备
-    data_dir = '/root/kuavo_ws/src/vla/trajectories'
-    file_names = [f'wave_{i:03d}.json' for i in range(1, 9)] + [f'welcome_{i:03d}.json' for i in range(1, 9)]
-    
-    print(f"使用数据文件: {len(file_names)} 个")
-    print(f"核心改进:")
-    print(f"  - 关节专用模型: {model_config['hidden_dim']}隐藏维度")
-    print(f"  - 符合CRITICAL PRINCIPLE: 指令分类 + 动作预测")
-    print(f"  - 关节专用预测器：不同指令专注不同关节")
-    print(f"  - 关节重要性权重学习")
-    print(f"  - 模型预计大小: 10-30MB")
-    
-    # 数据集
-    dataset = AdaptiveFrameSkipDataset(
-        data_dir, file_names, 
-        chunk_length=model_config['chunk_length']
-    )
-    
-    # 数据集划分
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=training_config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=training_config['batch_size'], shuffle=False)
-    
-    print(f"训练集: {len(train_dataset)}, 验证集: {len(val_dataset)}")
-    
-    # 创建关节专用模型
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    base_model = create_direct_action_model(model_config).to(device)
-    model = JointSpecializedPredictor(
-        base_model=base_model,
-        action_dim=model_config['action_dim'],
-        hidden_dim=model_config['hidden_dim'],
-        chunk_length=model_config['chunk_length'],
-        instruction_vocab_size=model_config['instruction_vocab_size'],
-        condition_dim=model_config['condition_dim']
-    ).to(device)
-    
-    # 计算参数数量
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数数量: {total_params:,}")
-    estimated_size_mb = total_params * 4 / (1024 * 1024)  # 估算模型大小(MB)
-    print(f"估算模型大小: {estimated_size_mb:.1f}MB")
-    
-    # 优化器 - 使用AdamW提高训练稳定性
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=training_config['learning_rate'],
-        weight_decay=training_config['weight_decay']
-    )
-    
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5,
-        patience=30,
-        verbose=True
-    )
-    
-    # 创建保存目录
-    save_dir = './checkpoints/enhanced_state_dependent_model_v1'
-    os.makedirs(save_dir, exist_ok=True)
-    
-    print(f"开始训练关节专用模型...")
-    
-    # 训练循环
-    best_val_loss = float('inf')
-    patience = 100
-    patience_counter = 0
-    
-    for epoch in range(training_config['epochs']):
-        # 训练阶段
-        model.train()
-        train_losses = []
-        train_action_losses = []
-        train_classification_losses = []
-        train_diversity_losses = []
-        train_specialization_losses = []
-        train_entropy_losses = []
-        train_dynamic_losses = []
-        train_accuracies = []
-        train_pattern_diffs = []
-        
-        for batch in train_loader:
-            start_states = batch['start_state'].to(device)
-            target_actions = batch['target_actions'].to(device)
-            instruction_ids = batch['instruction_id'].to(device)
-            
-            # 前向传播
-            outputs = model(instruction_ids, start_states)
-            predicted_changes = outputs['predicted_changes']
-            instruction_logits = outputs['instruction_logits']
-            wave_actions = outputs['wave_actions']
-            welcome_actions = outputs['welcome_actions']
-            wave_joint_weights = outputs['wave_joint_weights']
-            welcome_joint_weights = outputs['welcome_joint_weights']
-            
-            # 计算关节专用损失
-            loss_dict = model.compute_loss(
-                predicted_changes, target_actions, instruction_logits, instruction_ids,
-                wave_actions, welcome_actions, wave_joint_weights, welcome_joint_weights
-            )
-            
-            # 反向传播
-            optimizer.zero_grad()
-            loss_dict['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            # 记录损失
-            train_losses.append(loss_dict['total_loss'].item())
-            train_action_losses.append(loss_dict['action_loss'].item())
-            train_classification_losses.append(loss_dict['classification_loss'].item())
-            train_diversity_losses.append(loss_dict['diversity_loss'].item())
-            train_specialization_losses.append(loss_dict['specialization_loss'].item())
-            train_entropy_losses.append(loss_dict['entropy_loss'].item())
-            train_dynamic_losses.append(loss_dict['dynamic_loss'].item())
-            train_pattern_diffs.append(loss_dict['pattern_diff'].item())
-            
-            # 计算分类准确率
-            predicted_ids = torch.argmax(instruction_logits, dim=1)
-            accuracy = (predicted_ids == instruction_ids).float().mean().item()
-            train_accuracies.append(accuracy)
-        
-        # 验证阶段
-        model.eval()
-        val_losses = []
-        val_action_losses = []
-        val_classification_losses = []
-        val_diversity_losses = []
-        val_specialization_losses = []
-        val_entropy_losses = []
-        val_dynamic_losses = []
-        val_accuracies = []
-        val_pattern_diffs = []
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                start_states = batch['start_state'].to(device)
-                target_actions = batch['target_actions'].to(device)
-                instruction_ids = batch['instruction_id'].to(device)
-                
-                outputs = model(instruction_ids, start_states)
-                predicted_changes = outputs['predicted_changes']
-                instruction_logits = outputs['instruction_logits']
-                wave_actions = outputs['wave_actions']
-                welcome_actions = outputs['welcome_actions']
-                wave_joint_weights = outputs['wave_joint_weights']
-                welcome_joint_weights = outputs['welcome_joint_weights']
-                
-                # 计算关节专用损失
-                loss_dict = model.compute_loss(
-                    predicted_changes, target_actions, instruction_logits, instruction_ids,
-                    wave_actions, welcome_actions, wave_joint_weights, welcome_joint_weights
-                )
-                
-                val_losses.append(loss_dict['total_loss'].item())
-                val_action_losses.append(loss_dict['action_loss'].item())
-                val_classification_losses.append(loss_dict['classification_loss'].item())
-                val_diversity_losses.append(loss_dict['diversity_loss'].item())
-                val_specialization_losses.append(loss_dict['specialization_loss'].item())
-                val_entropy_losses.append(loss_dict['entropy_loss'].item())
-                val_dynamic_losses.append(loss_dict['dynamic_loss'].item())
-                val_pattern_diffs.append(loss_dict['pattern_diff'].item())
-                
-                # 计算分类准确率
-                predicted_ids = torch.argmax(instruction_logits, dim=1)
-                accuracy = (predicted_ids == instruction_ids).float().mean().item()
-                val_accuracies.append(accuracy)
-        
-        # 计算平均损失
-        avg_train_loss = np.mean(train_losses)
-        avg_train_action = np.mean(train_action_losses)
-        avg_train_classification = np.mean(train_classification_losses)
-        avg_train_diversity = np.mean(train_diversity_losses)
-        avg_train_specialization = np.mean(train_specialization_losses)
-        avg_train_entropy = np.mean(train_entropy_losses)
-        avg_train_dynamic = np.mean(train_dynamic_losses)
-        avg_train_accuracy = np.mean(train_accuracies)
-        avg_train_pattern_diff = np.mean(train_pattern_diffs)
-        
-        avg_val_loss = np.mean(val_losses)
-        avg_val_action = np.mean(val_action_losses)
-        avg_val_classification = np.mean(val_classification_losses)
-        avg_val_diversity = np.mean(val_diversity_losses)
-        avg_val_specialization = np.mean(val_specialization_losses)
-        avg_val_entropy = np.mean(val_entropy_losses)
-        avg_val_dynamic = np.mean(val_dynamic_losses)
-        avg_val_accuracy = np.mean(val_accuracies)
-        avg_val_pattern_diff = np.mean(val_pattern_diffs)
-        
-        # 更新学习率
-        scheduler.step(avg_val_loss)
-        
-        # 打印进度 - 每10个epoch打印一次
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch+1}/{training_config['epochs']} - "
-                  f"Total: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}, "
-                  f"Action: {avg_train_action:.4f}, Class: {avg_train_classification:.4f}, "
-                  f"Div: {avg_train_diversity:.4f}, Spec: {avg_train_specialization:.4f}, "
-                  f"Ent: {avg_train_entropy:.4f}, Acc: {avg_train_accuracy:.3f}, "
-                  f"Pattern: {avg_train_pattern_diff:.3f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
-        # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'model_config': model_config,
-                'training_config': training_config,
-                'best_val_loss': best_val_loss,
-                'pattern_diff': avg_val_pattern_diff,
-                'val_accuracy': avg_val_accuracy
-            }
-            
-            torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
-            print(f"  保存最佳模型 - Val Loss: {best_val_loss:.4f}, Acc: {avg_val_accuracy:.3f}")
-        else:
-            patience_counter += 1
-        
-        # 早停
-        if patience_counter >= patience:
-            print(f"早停: {patience} 轮验证损失没有改善")
-            break
-    
-    print("训练完成!")
-    print(f"最佳验证损失: {best_val_loss:.4f}")
-    print(f"模型参数数量: {total_params:,}")
-    print(f"估算模型大小: {estimated_size_mb:.1f}MB")
-    
-    return model, model_config, training_config
-
-if __name__ == "__main__":
-    model, model_config, training_config = train_joint_specialized_model()

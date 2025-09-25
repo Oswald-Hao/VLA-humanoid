@@ -1,0 +1,16 @@
+{
+  "intent": "conversation",
+  "confidence": 1.0,
+  "instruction": "none",
+  "response": "今天中午我推荐你可以尝试一些轻食，比如沙拉配鸡胸肉、三明治或者一碗热腾腾的汤面。如果你喜欢中式料理，可以考虑一份简单的炒饭或者盖浇饭。记得搭配一些蔬菜水果，营养更均衡哦！",
+  "action": "response",
+  "timestamp": 1758772441.8542602,
+  "recognition": {
+    "text": "夸父,夸父,你可以推荐一下我今天中午吃什么",
+    "confidence": 1.0,
+    "duration": 1.1810784339904785,
+    "engine": "whisper_small",
+    "wake_word_detected": true,
+    "command_text": ",,你可以推荐一下我今天中午吃什么"
+  }
+}
