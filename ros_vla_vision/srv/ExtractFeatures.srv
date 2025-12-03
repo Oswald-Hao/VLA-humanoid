@@ -1,0 +1,16 @@
+# Extract Features Service
+# 特征提取服务
+
+sensor_msgs/Image image       # 输入图像
+sensor_msgs/CameraInfo camera_info # 相机信息
+string feature_type         # 特征类型
+geometry_msgs/Pose2D roi     # 感兴趣区域 (可选)
+string extraction_method    # 提取方法
+float64 quality_threshold   # 质量阈值
+---
+bool success                 # 提取是否成功
+VLAVisualFeature[] features  # 提取的特征列表
+float64 processing_time      # 处理时间 (秒)
+int32 total_features         # 提取的特征总数
+float64 average_quality      # 平均质量评分
+string error_message         # 错误信息 (如果有)

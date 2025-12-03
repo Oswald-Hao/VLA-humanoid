@@ -1,0 +1,17 @@
+# Estimate Pose Service
+# 位姿估计服务
+
+sensor_msgs/Image image       # 输入图像
+sensor_msgs/CameraInfo camera_info # 相机信息
+string target_id             # 目标标识符
+string target_type           # 目标类型
+VLADetection initial_detection # 初始检测结果 (可选)
+sensor_msgs/PointCloud2 point_cloud # 点云数据 (可选)
+string reference_frame       # 参考坐标系
+---
+bool success                 # 估计是否成功
+VLAPoseEstimation pose_estimation # 位姿估计结果
+float64 processing_time      # 处理时间 (秒)
+string estimation_method     # 估计方法
+float64 uncertainty          # 不确定性估计
+string error_message         # 错误信息 (如果有)

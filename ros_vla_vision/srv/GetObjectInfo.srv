@@ -1,0 +1,16 @@
+# Get Object Info Service
+# 获取物体信息服务
+
+string object_id             # 物体标识符
+string object_name          # 物体名称 (可选)
+VLADetection detection      # 检测结果 (可选)
+sensor_msgs/Image image     # 相关图像 (可选)
+sensor_msgs/PointCloud2 point_cloud # 相关点云 (可选)
+string info_level           # 信息级别 (basic, detailed, full)
+---
+bool success                 # 获取是否成功
+VLAObjectInfo object_info    # 物体详细信息
+float64 processing_time      # 处理时间 (秒)
+string info_source          # 信息来源
+float64 data_freshness      # 数据新鲜度评分
+string error_message         # 错误信息 (如果有)

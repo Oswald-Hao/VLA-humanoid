@@ -1,0 +1,14 @@
+# Detect Objects Service
+# 物体检测服务
+
+sensor_msgs/Image image       # 输入图像
+sensor_msgs/CameraInfo camera_info # 相机信息
+string[] target_classes      # 目标类别列表 (可选，空表示检测所有)
+float64 confidence_threshold # 置信度阈值
+---
+bool success                 # 检测是否成功
+VLADetection[] detections    # 检测结果列表
+float64 processing_time      # 处理时间 (秒)
+string detection_method      # 检测方法
+int32 total_objects          # 检测到的物体总数
+string error_message         # 错误信息 (如果有)

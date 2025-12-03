@@ -1,0 +1,171 @@
+# VLM API Configuration File
+# 视觉语言模型API配置参数
+
+# VLM引擎配置
+vlm_engine:
+  # 引擎类型
+  engine_type: "zhipuai"  # zhipuai, openai, local, claude
+  
+  # 通用配置
+  common:
+    max_tokens: 500
+    temperature: 0.1
+    timeout: 30.0
+    retry_attempts: 3
+    retry_delay: 1.0
+    enable_caching: true
+    cache_timeout: 300.0
+
+# 智谱AI VLM配置
+zhipuai:
+  model: "GLM-4.1V-Thinking-FlashX"  # GLM-4V系列模型
+  api_key: "9ba047617693665f946995cb28e4fc58.c1TXBO9npfabrIZu"  # 从环境变量 ZHIPUAI_API_KEY 读取
+  api_base: "https://open.bigmodel.cn/api/paas/v4"
+  
+  # 请求配置
+  request:
+    max_tokens: 500
+    temperature: 0.1
+    top_p: 1.0
+  
+  # 端点配置
+  endpoints:
+    vision: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    models: "https://open.bigmodel.cn/api/paas/v4/models"
+
+# OpenAI VLM配置（备用）
+openai:
+  model: "gpt-4-vision-preview"
+  api_key: ""  # 从环境变量 OPENAI_API_KEY 读取
+  api_base: ""  # 自定义API基础URL，可选
+  
+  # 请求配置
+  request:
+    max_tokens: 500
+    temperature: 0.1
+    top_p: 1.0
+  
+  # 端点配置
+  endpoints:
+    vision: "https://api.openai.com/v1/chat/completions"
+    models: "https://api.openai.com/v1/models"
+
+# 本地VLM配置（备用）
+local:
+  model_path: ""  # 本地模型路径
+  device: "auto"  # auto, cpu, cuda
+  
+  # 请求配置
+  request:
+    max_tokens: 500
+    temperature: 0.1
+  
+# 图像处理配置
+image_processing:
+  encoding_format: "jpg"
+  encoding_quality: 85
+  max_image_size: 1024  # 最大图像尺寸（像素）
+  
+# 任务类型配置
+task_types:
+  # 纯视觉理解任务（不涉及抓取）
+  vision_only:
+    keywords: ["什么", "哪些", "描述", "分析", "看看", "观察", "有什么", "是什么"]
+    include_pose: false
+    include_depth: false
+    response_format: "text_only"
+    
+  # 抓取相关任务
+  grasping:
+    keywords: ["抓取", "拿", "取", "给我", "递给我", "拿起", "帮我拿", "帮我取"]
+    include_pose: true
+    include_depth: true
+    include_grasp_points: true
+    response_format: "full_data"
+    
+  # 位置查询任务
+  location_query:
+    keywords: ["在哪里", "位置", "坐标", "多远", "距离", "位置在哪"]
+    include_pose: true
+    include_depth: true
+    include_grasp_points: false
+    response_format: "pose_depth_only"
+
+# 对象类别映射
+object_class_mapping:
+  水: ["water", "bottle", "cup", "glass"]
+  苹果: ["apple", "fruit"]
+  杯子: ["cup", "glass", "mug"]
+  瓶子: ["bottle", "water_bottle"]
+  书: ["book"]
+  手机: ["phone", "cell_phone", "mobile"]
+  电脑: ["laptop", "computer"]
+  椅子: ["chair"]
+  桌子: ["table", "desk"]
+  人: ["person", "human"]
+    
+# 输出格式配置
+output_format:
+  include_confidence: true
+  include_processing_time: true
+  include_raw_response: false
+  structured_output: true
+  
+# ROS话题配置
+ros_topics:
+  # 订阅的话题
+  subscriptions:
+    language_command_topic: "/vla/recognition_result"
+    camera_image: "/camera_1/image_raw"
+    camera_info: "/camera_1/camera_info"
+    depth_points: "/depth_cam_1/points"
+    
+  # 发布的话题
+  publications:
+    object_pose_topic: "/vla/vision/object_pose"
+    object_depth_topic: "/vla/vision/object_depth"
+    grasp_points_topic: "/vla/vision/grasp_points"
+    vlm_result_topic: "/vla/vision/vlm_result"
+    target_object_info_topic: "/vla/vision/target_object_info"
+    scheduler_result_topic: "/vla/vision_scheduler/result"
+    
+# 对象跟踪配置
+object_tracking:
+  enable_tracking: true
+  tracking_timeout: 10.0  # 跟踪超时时间（秒）
+  max_objects: 20  # 最大跟踪对象数量
+  position_tolerance: 0.1  # 位置容忍度（米）
+
+# 数据发布配置
+data_publishing:
+  # 是否持续发布摄像头数据
+  continuous_publishing: false
+  # 发布频率（Hz）
+  publish_rate: 10.0
+  # 数据缓存时间（秒）
+  data_cache_timeout: 5.0
+
+# 缓存配置
+cache:
+  enable: true
+  timeout: 300.0
+  max_size: 1000
+
+# 日志配置
+logging:
+  enable: true
+  level: "info"
+  file_path: "logs/vlm_interface.log"
+
+# 错误处理配置
+error_handling:
+  max_retry_attempts: 3
+  retry_delay: 1.0
+  enable_fallback: true
+  fallback_to_vision_only: true
+  
+# 调试配置
+debug:
+  enable_debug_logging: true
+  save_api_responses: false
+  log_api_calls: true
