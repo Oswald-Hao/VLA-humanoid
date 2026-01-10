@@ -1,0 +1,117 @@
+{
+  "intents": {
+    "wave": {
+      "name": "挥手",
+      "description": "用户请求执行挥手动作",
+      "patterns": [
+        "挥手", "挥挥", "招手", "打招呼", "hello", "hi", "wave", "挥手动作", "招手动作", "打手势", "wave动作", "挥个手", "挥下手", "挥一下", "打个招呼", "招个手", "摆摆手", "摇手"
+      ],
+      "confidence_threshold": 0.3,
+      "response": "好的，我来为您挥挥手！",
+      "action": {
+        "type": "wave",
+        "instruction": "wave",
+        "description": "执行挥手动作"
+      },
+      "json_response": {
+        "intent": "wave",
+        "confidence": 0.0,
+        "instruction": "wave",
+        "response": "好的，我来为您挥挥手！",
+        "action": "wave",
+        "timestamp": 0
+      }
+    },
+    "welcome": {
+      "name": "抱拳",
+      "description": "用户请求执行抱拳动作",
+      "patterns": [
+        "抱拳", "敬礼", "欢迎", "问候", "welcome", "salute", "抱拳礼", "敬礼动作", "欢迎动作", "行礼", "抱个拳", "敬个礼", "行个礼", "打个招呼", "问候一下", "欢迎一下"
+      ],
+      "confidence_threshold": 0.3,
+      "response": "为您行抱拳礼！",
+      "action": {
+        "type": "welcome",
+        "instruction": "welcome",
+        "description": "执行抱拳动作"
+      },
+      "json_response": {
+        "intent": "welcome",
+        "confidence": 0.0,
+        "instruction": "welcome",
+        "response": "为您行抱拳礼！",
+        "action": "welcome",
+        "timestamp": 0
+      }
+    },
+    "stop": {
+      "name": "停止",
+      "description": "用户请求停止当前动作",
+      "patterns": [
+        "停止", "停", "别", "不要", "取消", "结束", "stop", "cancel", "停下", "停止动作"
+      ],
+      "confidence_threshold": 0.3,
+      "response": "我将停止当前的动作。",
+      "action": {
+        "type": "stop",
+        "instruction": "none",
+        "description": "停止当前动作"
+      },
+      "json_response": {
+        "intent": "stop",
+        "confidence": 0.0,
+        "instruction": "none",
+        "response": "我将停止当前的动作。",
+        "action": "stop",
+        "timestamp": 0
+      }
+    },
+    "no_input": {
+      "name": "无输入",
+      "description": "没有检测到语音输入",
+      "patterns": [],
+      "confidence_threshold": 0.0,
+      "response": "没有检测到语音输入，请检查麦克风连接或使用预设音频模式。",
+      "action": {
+        "type": "response",
+        "instruction": "none",
+        "text": "没有检测到语音输入，请检查麦克风连接或使用预设音频模式。"
+      },
+      "json_response": {
+        "intent": "no_input",
+        "confidence": 0.0,
+        "instruction": "none",
+        "response": "没有检测到语音输入，请检查麦克风连接或使用预设音频模式。",
+        "action": "response",
+        "timestamp": 0
+      }
+    },
+    "unknown": {
+      "name": "未知意图",
+      "description": "无法识别的用户意图",
+      "patterns": [],
+      "confidence_threshold": 0.0,
+      "response": "抱歉，我没有理解您的请求。请尝试用更清晰的语言表达，或者说'挥手'或'抱拳'。",
+      "action": {
+        "type": "response",
+        "instruction": "none",
+        "text": "抱歉，我没有理解您的请求。请尝试用更清晰的语言表达，或者说'挥手'或'抱拳'。"
+      },
+      "json_response": {
+        "intent": "unknown",
+        "confidence": 0.0,
+        "instruction": "none",
+        "response": "抱歉，我没有理解您的请求。请尝试用更清晰的语言表达，或者说'挥手'或'抱拳'。",
+        "action": "response",
+        "timestamp": 0
+      }
+    }
+  },
+  "metadata": {
+    "version": "2.0.0",
+    "last_updated": "2025-09-19",
+    "total_intents": 5,
+    "confidence_threshold": 0.3,
+    "supported_instructions": ["wave", "welcome", "none"]
+  }
+}

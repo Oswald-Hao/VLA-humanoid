@@ -1,0 +1,13 @@
+# Get Intent Service
+# 从文本中提取用户意图
+
+string text                  # 输入文本
+string context               # 上下文信息
+---
+bool success                 # 是否成功
+string intent_type           # 意图类型
+string intent_description    # 意图描述
+float64 confidence           # 置信度
+string[] entities            # 实体列表
+string[] slots               # 槽位填充结果
+string error_message         # 错误信息

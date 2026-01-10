@@ -1,0 +1,67 @@
+<launch>
+    <!-- ROS1 轨迹数据采集器启动文件 -->
+    
+    <!-- 基础参数 -->
+    <arg name="skill_id" default="welcome" />
+    <arg name="instruction" default="抱拳" />
+    <arg name="frames_per_episode" default="400" />
+    <arg name="frequency" default="100.0" />
+    <arg name="with_vision" default="false" />
+    
+    <!-- 话题参数 -->
+    <arg name="joint_state_topic" default="/humanoid_controller/optimizedState_mrt/joint_pos" />
+    <arg name="baselink_topic" default="/humanoid_controller/optimizedState_mrt/base/pos_xyz" />
+    <arg name="orientation_topic" default="/humanoid_controller/optimizedState_mrt/base/angular_zyx" />
+    <arg name="image_topic" default="/camera/image_raw" />
+    
+    <!-- 保存路径 -->
+    <arg name="save_dir" default="$(find vla)/trajectories" />
+    
+    <!-- 机器人参数 -->
+    <arg name="num_joints" default="26" />
+    
+    <!-- 采集控制参数 -->
+    <arg name="collection_mode" default="auto" />
+    <arg name="motion_threshold" default="0.02" />
+    <arg name="min_motion_frames" default="10" />
+    
+    <!-- 同步参数 -->
+    <arg name="sync_slop" default="0.1" />
+    
+    <!-- 技能参数 (JSON格式) -->
+    <arg name="skill_params" default="{}" />
+    
+    <!-- 启动采集器节点 -->
+    <node name="trajectory_collector" pkg="vla" type="ros_collector.py" output="screen">
+        <!-- 基础参数 -->
+        <param name="skill_id" value="$(arg skill_id)" />
+        <param name="instruction" value="$(arg instruction)" />
+        <param name="frames_per_episode" value="$(arg frames_per_episode)" />
+        <param name="frequency" value="$(arg frequency)" />
+        <param name="with_vision" value="$(arg with_vision)" />
+        
+        <!-- 话题参数 -->
+        <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+        <param name="baselink_topic" value="$(arg baselink_topic)" />
+        <param name="orientation_topic" value="$(arg orientation_topic)" />
+        <param name="image_topic" value="$(arg image_topic)" />
+        
+        <!-- 保存路径 -->
+        <param name="save_dir" value="$(arg save_dir)" />
+        
+        <!-- 机器人参数 -->
+        <param name="num_joints" value="$(arg num_joints)" />
+        
+        <!-- 采集控制参数 -->
+        <param name="collection_mode" value="$(arg collection_mode)" />
+        <param name="motion_threshold" value="$(arg motion_threshold)" />
+        <param name="min_motion_frames" value="$(arg min_motion_frames)" />
+        
+        <!-- 同步参数 -->
+        <param name="sync_slop" value="$(arg sync_slop)" />
+        
+        <!-- 技能参数 -->
+        <param name="skill_params" value="$(arg skill_params)" />
+    </node>
+    
+</launch>
